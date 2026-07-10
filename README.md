@@ -6,17 +6,27 @@ Este repositorio contiene un espacio de trabajo de **ROS 2** (`f1tenth_multi_ws`
 
 El sistema está diseñado para operar en el simulador **F1TENTH**, procesando datos de escaneo **LiDAR 2D** (`/scan`) y de odometría (`/odom`) para determinar el espacio libre de colisión y calcular comandos dinámicos de dirección y velocidad (`AckermannDriveStamped`).
 
-La arquitectura del paquete principal (`fdg_con_obstaculos_pkg`) soporta escenarios multivehículo mediante el remapeo de tópicos en el archivo de lanzamiento. Esto permite la ejecución paralela de múltiples instancias del mismo nodo para simular carreras con agentes estáticos y dinámicos.
+La lógica de automatización se mantiene contenida en su totalidad dentro de un único programa principal. Esta arquitectura centralizada optimiza el procesamiento del simulador y evita la segmentación en múltiples bloques funcionales. Es importante destacar que todos los vehículos (tanto el principal como los oponentes) ejecutan exactamente el mismo nodo. La diferenciación de comportamientos se realiza a través del archivo de lanzamiento (`launch`), el cual configura la relación de velocidades (`speed_scale`). A partir de este valor, el algoritmo asigna internamente los parámetros geométricos y de control correspondientes para cada rol.
 
-## 1.2 Videos demostrativos
-Video con obstàculos fijos: https://youtu.be/HVPSQLNa-fM
-Video con obstàculos fijos y mòviles: https://youtu.be/AIHKWGRq9hU
+### 1.1 Modificaciones respecto a la primera versión
 
-Nota: Con la configuración actual de los parámetros de calibracián el vehìculo tiene problemas para rebasar los obtáculos mòviles. Esto será resuelto en la siguiente actualización. 
+- **Implementación de Roles Dinámicos:** Se reestructuró la asignación de parámetros para soportar agentes con distintos perfiles de conducción (conservador vs. agresivo) operando sobre el mismo script, utilizando la variable `speed_scale` como identificador.
+- **Evasión Dinámica:** Se integró un control de histéresis modificado y limitadores de tasa de giro (*slew-rate*) para permitir rebases a obstáculos móviles.
+- **Resolución de Colisiones Internas:** Se ajustó la ponderación de profundidad y la tolerancia de proximidad para evitar que los oponentes de baja velocidad colisionen contra los muros internos de las curvas.
+
+### 1.2 Videos demostrativos
+
+- **Video con obstáculos fijos:** <https://youtu.be/HVPSQLNa-fM>
+- **Video de carrera multivehículo (2 oponentes, 10 vueltas):** <https://youtu.be/k7g-zZgQDug>
+
+> **Nota:** El sistema actual es capaz de completar 10 vueltas autónomas consecutivas en escenarios con múltiples agentes. Sin embargo, el algoritmo con la configuración presente aún tiene detalles por pulir frente a encierros generados por oponentes. La forma en la que está estructurado lo hace adecuado tanto para realizar giros a alta velocidad como para adoptar posturas más conservadoras para evasión de obstáculos. 
+Una conducción óptima y libre de colisiones residuales requiere de un ajuste más fino de los parámetros presentados.
+
+---
 
 # 2. Estructura del Repositorio
 
-Este repositorio contiene únicamente el código fuente (`src`). Las carpetas generadas automáticamente por ROS 2 (`build`, `install` y `log`) se omiten siguiendo las buenas prácticas, ya que estas se generarán al compilar.
+Este repositorio contiene únicamente el código fuente (`src`). Las carpetas generadas automáticamente por ROS 2 (`build`, `install` y `log`) se omiten siguiendo las buenas prácticas de control de versiones.
 
 ```text
 f1tenth_multi_ws/
@@ -92,23 +102,21 @@ src/f1tenth_gym_ros/config/sim.yaml
 
 ## Seleccionar el mapa
 
-Modificar:
+Modificar la ruta correspondiente al entorno de prueba:
 
 ```yaml
 map_path: Oschersleben_obs
 ```
 
-(o cualquier otro mapa disponible).
-
 ## Número de agentes
 
-### Pruebas individuales
+- **Pruebas individuales:**
 
 ```yaml
 num_agent: 1
 ```
 
-### Carrera multivehículo
+- **Carrera multivehículo:**
 
 ```yaml
 num_agent: 3
@@ -120,7 +128,7 @@ num_agent: 3
 
 ## 6.1 Modo Individual
 
-Utilizado para validar la resistencia del algoritmo (por ejemplo, completar 10 vueltas consecutivas sin colisiones).
+Utilizado para validar la resistencia algorítmica y métricas base.
 
 ### Terminal 1
 
@@ -138,17 +146,9 @@ source install/setup.bash
 ros2 run fdg_con_obstaculos_pkg follow_the_gap
 ```
 
----
-
 ## 6.2 Modo Carrera
 
-Ejecuta tres instancias del algoritmo simultáneamente para generar escenarios de adelantamiento y evasión.
-
-Configure previamente:
-
-```yaml
-num_agent: 3
-```
+Ejecuta tres instancias del algoritmo simultáneamente con parámetros cinemáticos diferenciados. Requiere `num_agent: 3` en `sim.yaml`.
 
 ### Terminal 1
 
@@ -168,31 +168,86 @@ ros2 launch fdg_con_obstaculos_pkg carrera_launch.py
 
 ---
 
-# 7. Calibración del Algoritmo (Tuning)
+# 7. Arquitectura del Algoritmo
 
-Todos los parámetros principales se encuentran definidos en:
+El nodo principal (`follow_the_gap_node.py`) procesa la información en un ciclo de seis etapas por cada mensaje recibido desde el tópico LiDAR:
 
-```text
-follow_the_gap_node.py
-```
+1. **Saneamiento y Filtrado:** Los datos crudos (incluyendo lecturas infinitas o nulas) son interpolados y pasados a través de un filtro de media móvil para reducir ruido de alta frecuencia.
 
-dentro de la clase:
+2. **Burbuja de Seguridad:** Se identifica el obstáculo más cercano y se anulan los rayos láser en un radio proyectado según el ancho físico del vehículo, previniendo colisiones de proximidad.
 
-```python
-FollowTheGapNode
-```
+3. **Restricción Visual y Selección de Huecos:** El campo de visión (FOV) se recorta dinámicamente según la velocidad del vehículo. Posteriormente, el algoritmo segmenta los vectores no nulos para encontrar ventanas continuas que superen un ancho mínimo viable.
 
-## Parámetros
+4. **Cálculo de Trazada:** Se evalúa el arreglo de distancias en el hueco seleccionado. La dirección final se pondera matemáticamente utilizando una relación entre el punto geométrico central del espacio libre y la lectura de mayor profundidad.
 
-| Parámetro | Función | Aumentar | Disminuir |
-|-----------|----------|----------|-----------|
-| **car_width** | Radio base de la burbuja de seguridad | Mayor separación respecto a obstáculos | Permite rebases más estrechos, aumenta riesgo de colisión |
-| **ema_alpha** | Filtro EMA del ángulo objetivo | Respuesta más rápida | Mayor suavizado, introduce retardo |
-| **Kp** | Ganancia proporcional del controlador PD | Correcciones agresivas, posible serpenteo | Dirección lenta en curvas |
-| **Kd** | Ganancia derivativa | Reduce oscilaciones | Mayor vibración direccional |
-| **rate_tight** | Límite de velocidad del servo | Maniobras evasivas más rápidas | Menor agilidad |
-| **gap_switch_margin** | Histéresis para cambiar de trayectoria | Mantiene la ruta actual | Cambios frecuentes de trayectoria |
-| **max_weight_depth** | Peso del punto más lejano respecto al centro del gap | Prioriza distancia máxima, puede generar inestabilidad | Prioriza el centro del espacio libre, conducción más estable |
+5. **Control Direccional PD:** La diferencia angular resultante es introducida a un controlador Proporcional-Derivativo, el cual incluye límites mecánicos de actuación (*slew-rate*) para emular restricciones físicas del servomotor y amortiguar sobreimpulsos.
+
+6. **Acelerador Dinámico:** La velocidad lineal final se calcula modularmente. Aumenta con la distancia libre frontal y se somete a una penalización sustractiva proporcional a la magnitud del giro del volante para garantizar tracción.
 
 ---
 
+# 8. Calibración del Algoritmo (Parámetros)
+
+Las variables operativas del nodo determinan el comportamiento dinámico del vehículo. La modificación de las siguientes variables permite adaptar la conducción según el escenario.
+
+## Parámetros de Percepción
+
+### `lidar_filter_window`
+
+Define la cantidad de rayos consecutivos promediados. Valores menores agudizan la detección de bordes, mientras que valores mayores suavizan la señal a costa de introducir retardo.
+
+### `car_width`
+
+Ancho base utilizado para calcular la viabilidad de un espacio. Aumentar este valor fuerza al vehículo a descartar trayectorias estrechas.
+
+### `hard_min_clearance`
+
+Margen absoluto de seguridad. Cualquier lectura LiDAR inferior a este umbral se considera bloqueada, operando como un perímetro repulsivo contra los muros.
+
+### `bubble_min_dist`
+
+Radio mínimo para la proyección de la burbuja de seguridad alrededor del objeto más cercano detectado.
+
+---
+
+## Parámetros de Control Direccional
+
+### `Kp` (Proporcional)
+
+Determina la agresividad de corrección hacia el ángulo objetivo.
+
+### `Kd` (Derivativo)
+
+Amortigua la inercia angular para evitar oscilaciones o sobreimpulsos cruzando la línea central.
+
+### `rate_open` / `rate_tight`
+
+Límites mecánicos simulados para el servomotor. Dictan la velocidad máxima permitida para cambios en el ángulo de dirección en condiciones normales y de emergencia, respectivamente.
+
+### `ema_alpha`
+
+Factor de ponderación del Filtro de Media Móvil Exponencial (EMA). Valores cercanos a `1.0` proporcionan reflejos instantáneos; valores menores introducen retención de trayectoria.
+
+---
+
+## Parámetros de Estrategia
+
+### `max_weight_depth`
+
+Ponderación geométrica de la trayectoria. Un valor alto hace que el vehículo apunte hacia la línea de visión más larga (el ápice de la curva), mientras que un valor bajo lo obliga a mantenerse en el centro geométrico del pasillo.
+
+### `gap_switch_margin`
+
+Margen de histéresis. Determina la ventaja proporcional que debe tener una ruta alternativa para que el vehículo decida abandonar su carril actual. Controla la resistencia a oscilar entre huecos (Asno de Buridán).
+
+---
+
+## Parámetros de Propulsión
+
+### `speed_dist_gain`
+
+Coeficiente multiplicador aplicado a la distancia libre frontal detectada.
+
+### `speed_steer_penalty`
+
+Factor de freno. Resta velocidad de forma directamente proporcional al ángulo aplicado en el volante, simulando transferencia de peso direccional.

@@ -21,58 +21,72 @@ class FollowTheGapNode(Node):
             Odometry, '/ego_racecar/odom', self.odom_callback, 10)
         self.drive_pub = self.create_publisher(AckermannDriveStamped, '/drive', 10)
 
-        self.car_width = 1.17  # Protege la cola sin cegar al auto
+        # 1. PARÁMETROS COMUNES (Compartidos por todos los autos)
 
-        # Filtros de visión y dirección
-        self.lidar_filter_window = 5
-        self.ema_alpha           = 0.35
+        # Filtros base
+        self.lidar_filter_window = 3
         self.raw_angle_ema       = 0.0
 
-        # Control PD, conectado a la salida final
-        self.Kp                  = 0.28
-        self.Kd                  = 0.62
+
+        self.car_width           = 0.33  # Ancho real del auto (0.27) + tolerancia
+
+        # Control PD
+        self.Kp                  = 0.42
+        self.Kd                  = 0.69
         self.prev_error          = 0.0
 
-        # NUEVO: Escala de velocidad desde el launch file
+        # Escala de velocidad desde el launch file (Identificador de rol)
         self.declare_parameter('speed_scale', 1.0)
         self.speed_scale = self.get_parameter('speed_scale').value
 
-        # Limitador de latigazos mecánicos (Slew-Rate), aplicado por ciclo
-        self.rate_open           = 0.03
-        self.rate_tight          = 0.09
+        # Limitador de latigazos mecánicos (Slew-Rate)
+        self.rate_open           = 0.22
+        self.rate_tight          = 0.67
         self.angle_trigger_min   = 0.07
-        self.angle_trigger_max   = 0.27
-        self.steering_deadband   = 0.015
+        self.angle_trigger_max   = 0.20
+        self.steering_deadband   = 0.010
         self.prev_steering_angle = 0.0
         self.max_steer           = 0.4189
         self.instability_ema     = 0.0
 
-        # Velocidad actual (para ventana de visión dinámica), viene de odom
-        self.current_speed = 0.0
+        # Parámetros de Control de Velocidad (Acelerador)
+        self.speed_base          = 5.2   # Velocidad constante base 
+        self.speed_dist_gain     = 0.10  # Aceleración extra por distancia libre al frente  
+        self.speed_steer_penalty = 22.0  # Freno aplicado (resta) al girar el volante 
+        self.speed_min           = 4.5   # Tope mínimo de velocidad (curvas cerradas) 
+        self.speed_max           = 9.5   # Tope máximo de velocidad (rectas largas) 
+        self.current_speed       = 0.0   # Velocidad actual (para ventana de visión dinámica), viene de odom 
 
-        # Ventana de visión: límites entre los que se interpola según velocidad
-        self.fov_narrow = (0.25, 0.75)  # a alta velocidad, en recta
-        self.fov_wide   = (0.10, 0.90)  # a baja velocidad, en chicanas/curvas cerradas
+        # Ventana de visión dinámica (Ceguera periférica en curvas)
+        self.fov_narrow = (0.30, 0.70)  
+        self.fov_wide   = (0.22, 0.78)  
         self.speed_low  = 4.5
         self.speed_high = 9.0
 
-        # Histeresis de selección de gap (evita que el "gap ganador" salte entre frames)
-        self.prev_gap_start    = None
-        self.prev_gap_end      = None
-        self.gap_switch_margin = 1.20  # el nuevo gap debe ser 20% mas grande para reemplazar al anterior
+        # Variables de memoria e histeresis (inicialización nula)
+        self.prev_gap_start      = None
+        self.prev_gap_end        = None
+        self.angle_history       = deque(maxlen=8)
+        self._last_valid_ranges  = None
+        self.bubble_min_dist     = 0.37  
 
-        # Métrica de estabilidad de la escena (reemplaza a raw_angle_ema como criterio de t_traj)
-        self.angle_history = deque(maxlen=8)
+        # 2. PARÁMETROS ESPECÍFICOS SEGÚN EL ROL (Multi-Agente)
+        
+        if self.speed_scale < 1.0:
+            # OPONENTES
+            self.hard_min_clearance = 0.50  # Margen contra muros internos
+            self.max_weight_depth   = 0.05  
+            self.gap_switch_margin  = 1.50
+            self.ema_alpha          = 0.45  
+        else:
+            # AUTO PRINCIPAL
+            self.hard_min_clearance = 0.22   # Reducido para que no entre en pánico al pasar rozando al oponente 
+            self.max_weight_depth   = 0.45   # Busca la salida (el ápice)
+            self.gap_switch_margin  = 1.15   # Cambia de idea rápido para rebasar
+            self.ema_alpha          = 0.95  
 
-        # Sostiene la ultima lectura valida del LiDAR, para rellenar dropouts (inf/nan)
-        self._last_valid_ranges = None
 
-        # Margenes de seguridad respecto al borde de la pista
-        self.hard_min_clearance = 0.55  # metros, descarta como "camino" cualquier lectura mas cercana
-        self.bubble_min_dist    = 0.28  # piso para el calculo de la burbuja de seguridad
-        self.max_weight_depth   = 0.60  # tope de cuanto se favorece el punto mas profundo vs el centro
-
-        # --- TELEMETRÍA ---
+        # 3. TELEMETRÍA
         self.start_x           = None
         self.start_y           = None
         self.lap_start_time    = None
@@ -83,20 +97,22 @@ class FollowTheGapNode(Node):
         self.left_start_zone   = False
 
         self._odom_check_timer = self.create_timer(3.0, self._check_odom_connection)
-        self.get_logger().info("Piloto FTG v4 iniciado.")
+        self.get_logger().info("Piloto FTG Multi-Agente iniciado.")
+
+
+    # FUNCIONES DE UTILIDAD Y CALLBACKS
 
     def _check_odom_connection(self):
-        # Acepta el nombre del launch (ftg_ego) o el nombre por defecto (follow_the_gap_node)
+        """Verifica el estado de conexión del tópico de odometría inicial y detiene el temporizador."""
         if self.get_name() in ['ftg_ego', 'follow_the_gap_node']:
             if self.start_x is None:
                 self.get_logger().error("Sin odometría en '/ego_racecar/odom' tras 3s.")
             else:
                 self.get_logger().info("Odometría OK en '/ego_racecar/odom'.")
-                
-        # Pero TODOS los autos cancelan su temporizador para no consumir recursos
         self._odom_check_timer.cancel()
 
     def odom_callback(self, msg):
+        """Procesa la velocidad actual del vehículo y gestiona la telemetría de vueltas y tiempos."""
         cx = msg.pose.pose.position.x
         cy = msg.pose.pose.position.y
         self.current_speed = math.hypot(msg.twist.twist.linear.x, msg.twist.twist.linear.y)
@@ -106,73 +122,111 @@ class FollowTheGapNode(Node):
             self.last_x  = cx;  self.last_y  = cy
             self.lap_start_time = time.time()
             return
+            
         self.distance_traveled += math.hypot(cx - self.last_x, cy - self.last_y)
         self.last_x = cx;  self.last_y = cy
-        if self.distance_traveled > 15.0: self.left_start_zone = True
+        
+        if self.distance_traveled > 15.0: 
+            self.left_start_zone = True
         
         if self.left_start_zone and math.hypot(cx - self.start_x, cy - self.start_y) < 2.0:
             lap_time = time.time() - self.lap_start_time
             self.lap_count += 1
-            
-            # NUEVO: Verificamos que sea el auto principal, ya sea por launch o directo
             if self.get_name() in ['ftg_ego', 'follow_the_gap_node']:
                 self.get_logger().info(f"🏁 [VUELTA {self.lap_count}] Tiempo: {lap_time:.2f} s")
-                
             self.lap_start_time = time.time(); self.distance_traveled = 0.0; self.left_start_zone = False
 
     def preprocess_lidar(self, ranges):
-        # Rellena dropouts (inf/nan) con la ultima lectura valida en vez de asumir via libre
+        """Sanea los datos brutos del LiDAR, rellenando valores nulos o infinitos con la última lectura válida."""
         r = np.array(ranges, dtype=np.float32)
         invalid = np.isinf(r) | np.isnan(r)
-
         if self._last_valid_ranges is None:
             r[invalid] = 0.0
         else:
             r[invalid] = self._last_valid_ranges[invalid]
-
         self._last_valid_ranges = r.copy()
         return r
 
     def smooth_ranges(self, ranges):
+        """Aplica un filtro de convolución (media móvil) para reducir el ruido en las lecturas láser."""
         k = np.ones(self.lidar_filter_window) / self.lidar_filter_window
         return np.convolve(ranges, k, mode='same')
 
-    def get_dynamic_fov(self):
-        # Interpola el FOV util entre estrecho (recta rapida) y amplio (chicana/curva lenta)
-        t = float(np.clip((self.current_speed - self.speed_low) / (self.speed_high - self.speed_low), 0.0, 1.0))
-        lo = self.fov_wide[0] + t * (self.fov_narrow[0] - self.fov_wide[0])
-        hi = self.fov_wide[1] + t * (self.fov_narrow[1] - self.fov_wide[1])
-        return lo, hi
+    def get_fov_indices(self, msg, n):
+        """Calcula la ventana de vision: la mas estrecha entre el limite duro de 180 grados
+        frontales y la ventana dinamica segun velocidad."""
+        max_half_angle = math.radians(90)
+        hard_lo = max(0, int((-max_half_angle - msg.angle_min) / msg.angle_increment))
+        hard_hi = min(n, int((max_half_angle - msg.angle_min) / msg.angle_increment))
 
-    def select_gap(self, front_ranges):
-        # Division simple por continuidad de indice (base estable, sin split por distancia)
+        t = float(np.clip((self.current_speed - self.speed_low) / (self.speed_high - self.speed_low), 0.0, 1.0))
+        lo_frac = self.fov_wide[0] + t * (self.fov_narrow[0] - self.fov_wide[0])
+        hi_frac = self.fov_wide[1] + t * (self.fov_narrow[1] - self.fov_wide[1])
+        dyn_lo = int(n * lo_frac)
+        dyn_hi = int(n * hi_frac)
+
+        start_idx = max(hard_lo, dyn_lo)
+        end_idx   = min(hard_hi, dyn_hi)
+        return start_idx, end_idx
+
+    def select_gap(self, front_ranges, msg, straight_idx):
+        """Localiza gaps con ancho fisico suficiente para pasar, y entre esos, prefiere
+        el que requiera MENOR cambio de rumbo respecto al frente del auto."""
         nz = np.where(front_ranges > 0.0)[0]
         if len(nz) == 0:
             return None
 
         gaps = np.split(nz, np.where(np.diff(nz) != 1)[0] + 1)
-        best_gap = max(gaps, key=len)
+
+        min_required_width = self.car_width + 0.08
+        viable = []
+        for g in gaps:
+            avg_dist = float(np.mean(front_ranges[g]))
+            width_m = avg_dist * msg.angle_increment * len(g)
+            if width_m >= min_required_width:
+                viable.append(g)
+        if not viable:
+            viable = gaps
+
+        def offset(g):
+            return abs((g[0] + g[-1]) / 2.0 - straight_idx)
+
+        best_gap = min(viable, key=offset)
 
         if self.prev_gap_start is not None:
-            prev_candidates = [g for g in gaps if g[0] <= self.prev_gap_end and g[-1] >= self.prev_gap_start]
+            prev_candidates = [g for g in viable if g[0] <= self.prev_gap_end and g[-1] >= self.prev_gap_start]
             if prev_candidates:
                 prev_match = max(prev_candidates, key=len)
-                if len(best_gap) < len(prev_match) * self.gap_switch_margin:
+                if offset(best_gap) * self.gap_switch_margin >= offset(prev_match):
                     best_gap = prev_match
 
         self.prev_gap_start = int(best_gap[0])
         self.prev_gap_end   = int(best_gap[-1])
         return best_gap
 
+
+    # CICLO PRINCIPAL DE CONTROL
+
     def scan_callback(self, msg):
+        """Ejecuta secuencialmente las fases del algoritmo Follow The Gap con los datos LiDAR recientes."""
         ranges = self.preprocess_lidar(msg.ranges)
         ranges = self.smooth_ranges(ranges)
         n = len(ranges)
 
-        # PASO 1: Burbuja Global
+        # PASO 1: Burbuja Global con ancho adaptativo segun proximidad
         closest_idx_global  = int(np.argmin(ranges))
         closest_dist_global = float(ranges[closest_idx_global])
-        bubble_angle      = math.atan2(self.car_width / 2.0, max(closest_dist_global, self.bubble_min_dist))
+
+        # Si el objeto mas cercano esta a una distancia tipica de encuentro con otro auto,
+        # se asume margen combinado (dos cuerpos). Lejos, se mantiene el margen ajustado
+        # que permite buenas trazadas de apex en curva.
+        proximity_threshold = 3.5  # metros
+        if closest_dist_global < proximity_threshold:
+            effective_width = self.car_width + 0.12  # margen extra estimado para un segundo cuerpo
+        else:
+            effective_width = self.car_width
+
+        bubble_angle      = math.atan2(effective_width / 2.0, max(closest_dist_global, self.bubble_min_dist))
         rays_to_eliminate = int(bubble_angle / msg.angle_increment)
         b_start = max(0, closest_idx_global - rays_to_eliminate)
         b_end   = min(n, closest_idx_global + rays_to_eliminate)
@@ -181,12 +235,13 @@ class FollowTheGapNode(Node):
         ranges[ranges < self.hard_min_clearance] = 0.0
 
         # PASO 2: Visión dinámica y búsqueda de gaps con histeresis
-        fov_lo, fov_hi = self.get_dynamic_fov()
-        start_idx = int(n * fov_lo)
-        end_idx   = int(n * fov_hi)
+        start_idx, end_idx = self.get_fov_indices(msg, n)
         front_ranges = ranges[start_idx:end_idx].copy()
 
-        largest_gap = self.select_gap(front_ranges)
+        # Indice que representa "recto al frente" (angulo 0) dentro de front_ranges
+        straight_idx = int(np.clip((n // 2) - start_idx, 0, len(front_ranges) - 1))
+
+        largest_gap = self.select_gap(front_ranges, msg, straight_idx)
         if largest_gap is None:
             out = AckermannDriveStamped()
             out.drive.speed = 3.0; out.drive.steering_angle = 0.0
@@ -204,6 +259,7 @@ class FollowTheGapNode(Node):
             instability = float(np.std(self.angle_history))
         else:
             instability = 0.0
+            
         self.instability_ema = 0.85 * self.instability_ema + 0.15 * instability
         t_traj = float(np.clip((self.instability_ema - self.angle_trigger_min) /
                                (self.angle_trigger_max - self.angle_trigger_min), 0.0, 1.0))
@@ -244,12 +300,15 @@ class FollowTheGapNode(Node):
         smoothed = self.prev_steering_angle + delta
         self.prev_steering_angle = smoothed
 
-        # PASO 6: Acelerador
+        # PASO 6: Acelerador dinámico paramétrico
         abs_steer = abs(smoothed)
-        speed = float(np.clip(5.0+ (target_distance * 0.20) - (10.0 * abs_steer), 4.4, 13.0))
+        
+        # Fórmula extraída utilizando las nuevas variables del __init__
+        raw_speed = self.speed_base + (target_distance * self.speed_dist_gain) - (self.speed_steer_penalty * abs_steer)
+        speed = float(np.clip(raw_speed, self.speed_min, self.speed_max))
 
         out = AckermannDriveStamped()
-        # NUEVO: Escala de velocidad desde el launch file
+        
         # Aplicamos el multiplicador a la velocidad final:
         out.drive.speed = speed * self.speed_scale
         out.drive.steering_angle = smoothed
