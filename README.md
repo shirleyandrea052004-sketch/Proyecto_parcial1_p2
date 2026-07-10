@@ -8,13 +8,18 @@ El sistema está diseñado para operar en el simulador **F1TENTH**, procesando d
 
 La lógica de automatización se mantiene contenida en su totalidad dentro de un único programa principal. Esta arquitectura centralizada optimiza el procesamiento del simulador y evita la segmentación en múltiples bloques funcionales. Es importante destacar que todos los vehículos (tanto el principal como los oponentes) ejecutan exactamente el mismo nodo. La diferenciación de comportamientos se realiza a través del archivo de lanzamiento (`launch`), el cual configura la relación de velocidades (`speed_scale`). A partir de este valor, el algoritmo asigna internamente los parámetros geométricos y de control correspondientes para cada rol.
 
-### 1.1 Modificaciones respecto a la primera versión
+### 1.1 Mapas y Entornos de Simulación
+
+Este espacio de trabajo integra un paquete dedicado exclusivamente a las pistas de carreras (f1tenth_racetracks). Además de los entornos base incluidos en la instalación estándar del simulador, se ha incorporado esta colección de mapas suplementarios extraídos de repositorios externos especializados en trazados de competición (como es el caso del circuito Oschersleben_obs). Todos los archivos de imagen (.png) y configuración geométrica (.yaml) se encuentran centralizados en este directorio paralelo dentro de la arquitectura del proyecto, garantizando la ejecución inmediata de cualquier circuito sin requerir dependencias o descargas adicionales.
+
+### 1.2 Modificaciones respecto a la primera versión
 
 - **Implementación de Roles Dinámicos:** Se reestructuró la asignación de parámetros para soportar agentes con distintos perfiles de conducción (conservador vs. agresivo) operando sobre el mismo script, utilizando la variable `speed_scale` como identificador.
-- **Evasión Dinámica:** Se integró un control de histéresis modificado y limitadores de tasa de giro (*slew-rate*) para permitir rebases a obstáculos móviles.
+- **Evasión Dinámica:** Se integró un control de histéresis modificado y limitadores de tasa de giro (slew-rate) para permitir rebases a obstáculos móviles.
 - **Resolución de Colisiones Internas:** Se ajustó la ponderación de profundidad y la tolerancia de proximidad para evitar que los oponentes de baja velocidad colisionen contra los muros internos de las curvas.
 
-### 1.2 Videos demostrativos
+
+### 1.3 Videos demostrativos
 
 - **Video con obstáculos fijos:** <https://youtu.be/HVPSQLNa-fM>
 - **Video de carrera multivehículo (2 oponentes, 10 vueltas):** <https://youtu.be/k7g-zZgQDug>
@@ -24,9 +29,9 @@ Una conducción óptima y libre de colisiones residuales requiere de un ajuste m
 
 ---
 
-# 2. Estructura del Repositorio
+## 2. Estructura del Repositorio
 
-Este repositorio contiene únicamente el código fuente (`src`). Las carpetas generadas automáticamente por ROS 2 (`build`, `install` y `log`) se omiten siguiendo las buenas prácticas de control de versiones.
+Este repositorio contiene únicamente el código fuente (src). Las carpetas generadas automáticamente por ROS 2 (build, install y log) se omiten siguiendo las buenas prácticas de control de versiones. El directorio independiente f1tenth_racetracks contiene la totalidad de los circuitos base y suplementarios requeridos para la simulación.
 
 ```text
 f1tenth_multi_ws/
@@ -36,6 +41,13 @@ f1tenth_multi_ws/
 │   │   │   └── sim.yaml
 │   │   ├── launch/
 │   │   │   └── gym_bridge_launch.py
+│   │   └── ...
+│   │
+│   ├── f1tenth_racetracks/
+│   │   ├── maps/
+│   │   │   ├── Oschersleben_obs.png
+│   │   │   ├── Oschersleben_obs.yaml
+│   │   │   └── ... (mapas consolidados)
 │   │   └── ...
 │   │
 │   └── fdg_con_obstaculos_pkg/
